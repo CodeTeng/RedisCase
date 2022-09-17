@@ -307,3 +307,278 @@ RedisTemplate 默认使用 JDK 原生序列化器，可读性差，内存占用�
 
 1. **自定义 RedisTemplate**，指定 key 和 value 的序列化器
 2. **使用自带的 StringRedisTemplate**，key 和 value 都默认使用 String 序列化器，仅支持写入 String 类型的 key 和 value。因此需要自己将对象序列化成 String 来写入Redis，从 Redis读出数据时也要手动反序列化。
+
+# Redis实战篇
+
+![image-20220917214317341](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209172143403.png)
+
+## 1. 短信登录
+
+### 1.1 基于Session实现登录流程
+
+![image-20220917230605854](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209172306930.png)
+
+### 1.2 实现发送短信验证码
+
+![image-20220917230802381](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209172308455.png)
+
+核心代码：
+
+```java
+public Result sendCode(String phone, HttpSession session) {
+    // 1. 校验手机号
+    if (RegexUtils.isPhoneInvalid(phone)) {
+        return Result.fail("非法的手机号码");
+    }
+    // 2. 生成验证码
+    String code = RandomUtil.randomNumbers(6);
+    // 3. 保存验证码到session中
+    session.setAttribute(SystemConstants.USER_SESSION_CODE, code);
+    // 4. 模拟发送验证码
+    log.debug("短信验证码为：{}", code);
+    return Result.ok();
+}
+```
+
+### 1.3 实现登录、注册功能
+
+![image-20220917231459359](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209172314410.png)
+
+核心代码：
+
+```java
+public Result login(LoginFormDTO loginForm, HttpSession session) {
+    String code = loginForm.getCode();
+    String phone = loginForm.getPhone();
+    // 1. 校验表单
+    if (StrUtil.isBlank(phone)) {
+        return Result.fail("手机号不能为空");
+    }
+    if (StrUtil.isBlank(code)) {
+        return Result.fail("验证码不能为空");
+    }
+    // 2. 校验手机号
+    if (RegexUtils.isPhoneInvalid(phone)) {
+        return Result.fail("手机号格式错误");
+    }
+    // 3. 校验验证码
+    String sessionCode = (String) session.getAttribute(SystemConstants.USER_SESSION_CODE);
+    if (!code.equals(sessionCode)) {
+        return Result.fail("验证码错误");
+    }
+    // 4. 根据手机号查询用户
+    User user = this.query().eq("phone", phone).one();
+    // 5. 若不存在 进行注册
+    if (Objects.isNull(user)) {
+        user = createUserWithPhone(phone);
+    }
+    // 6. 若存在，将用户保存到session中
+    session.setAttribute(SystemConstants.USER_SESSION_USER, BeanUtil.copyProperties(user, UserDTO.class));
+    return Result.ok();
+}
+```
+
+### 1.4 实现登录拦截功能
+
+![image-20220917234850290](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209172348345.png)
+
+拦截器代码：
+
+```java
+public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) throws Exception {
+    // 1. 获取session
+    HttpSession session = request.getSession();
+    // 2.获取session中的用户
+    Object user = session.getAttribute(SystemConstants.USER_SESSION_USER);
+    // 3. 判断用户是否存在
+    if (user == null) {
+        // 4. 不存在，拦截
+        response.setStatus(401);
+        return false;
+    }
+    // 5. 存在 保存用户信息到ThreadLocal
+    UserHolder.saveUser((UserDTO) user);
+    // 6. 放行
+    return true;
+}
+```
+
+相关配置
+
+```java
+public void addInterceptors(InterceptorRegistry registry) {
+        // 登录拦截器
+        registry.addInterceptor(new LoginInterceptor())
+                .excludePathPatterns(
+                        "/shop/**",
+                        "/voucher/**",
+                        "/shop-type/**",
+                        "/upload/**",
+                        "/blog/hot",
+                        "/user/code",
+                        "/user/login"
+                );
+    }
+```
+
+> 注意：可以使用`threadlocal`来做到**线程隔离**，每个线程操作自己的一份数据
+>
+> 在`threadLocal`中，无论是他的`put`方法和他的`get`方法， 都是先从获得当前用户的线程，然后从线程中取出线程的成员变量`map`，只要线程不一样，`map`就不一样，所以可以通过这种方式来做到**线程隔离**
+
+### 1.5 session共享问题
+
+![image-20220918002157478](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209180021584.png)
+
+### 1.6 基于Redis实现共享session登录
+
+#### 1.6.1 设计key的结构
+
+首先我们要思考一下利用redis来存储数据，那么到底使用哪种结构呢？由于存入的数据比较简单，我们可以考虑使用String，或者是使用
+
+哈希，如下图，如果使用String，注意他的value，用多占用一点空间，如果使用哈希，则他的value中只会存储他数据本身，如果不是特
+
+别在意内存，其实使用String就可以。
+
+![image-20220918003115508](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209180031591.png)
+
+#### 1.6.2 设计key的小细节
+
+所以我们可以使用String结构，就是一个简单的key，value键值对的方式，但是关于key的处理，session他是每个用户都有自己的
+
+session，但是redis的key是共享的，就不能使用code了
+
+在设计这个key的时候，我们之前讲过需要满足两点
+
+- key要具有唯一性
+- key要方便携带
+
+如果我们采用phone：手机号这个的数据来存储当然是可以的，但是如果把这样的敏感数据存储到redis中并且从页面中带过来毕竟不太
+
+合适，所以我们在后台生成一个随机串token，然后让前端带来这个token就能完成我们的整体逻辑了。
+
+### 1.7 基于Redis实现短信登录
+
+![image-20220918003644509](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209180036702.png)
+
+```java
+stringRedisTemplate.opsForValue().set(RedisConstants.LOGIN_CODE_KEY + phone, code, RedisConstants.LOGIN_CODE_TTL, TimeUnit.MINUTES);
+```
+
+![image-20220918003234219](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209180032297.png)
+
+核心代码：
+
+```java
+public Result login(LoginFormDTO loginForm, HttpSession session) {
+    String code = loginForm.getCode();
+    String phone = loginForm.getPhone();
+    // 1. 校验表单
+    if (StrUtil.isBlank(phone)) {
+        return Result.fail("手机号不能为空");
+    }
+    if (StrUtil.isBlank(code)) {
+        return Result.fail("验证码不能为空");
+    }
+    // 2. 校验手机号
+    if (RegexUtils.isPhoneInvalid(phone)) {
+        return Result.fail("手机号格式错误");
+    }
+    // 3. 校验验证码--->从redis中进行获取
+    // String sessionCode = (String) session.getAttribute(SystemConstants.USER_SESSION_CODE);
+    String redisCode = stringRedisTemplate.opsForValue().get(RedisConstants.LOGIN_CODE_KEY + phone);
+    if (!code.equals(redisCode)) {
+        return Result.fail("验证码错误");
+    }
+    // 4. 根据手机号查询用户
+    User user = this.query().eq("phone", phone).one();
+    // 5. 若不存在 进行注册
+    if (Objects.isNull(user)) {
+        user = createUserWithPhone(phone);
+    }
+    // 6. 若存在，将用户保存到session中--->保存到redis中---记得脱敏数据
+    // session.setAttribute(SystemConstants.USER_SESSION_USER, BeanUtil.copyProperties(user, UserDTO.class));
+    // 6.1 生成token
+    String token = UUID.randomUUID().toString(true);
+    // 6.2 将user对象转为Hash进行存储
+    UserDTO userDTO = BeanUtil.copyProperties(user, UserDTO.class);
+    Map<String, Object> userMap = BeanUtil.beanToMap(userDTO, new HashMap<>(),
+                                                     CopyOptions.create()
+                                                     .setIgnoreNullValue(true)
+                                                     .setFieldValueEditor((filedName, filedValue) -> filedValue.toString()));
+    // 6.3 存到redis中
+    String tokenKey = RedisConstants.LOGIN_USER_KEY + token;
+    stringRedisTemplate.opsForHash().putAll(tokenKey, userMap);
+    // 6.4 设置token的有效期
+    stringRedisTemplate.expire(tokenKey, RedisConstants.LOGIN_USER_TTL, TimeUnit.MINUTES);
+
+    // 7. 返回token
+    return Result.ok(token);
+}
+```
+
+### 1.8 解决状态登录刷新问题
+
+#### 1.8.1 初始方案问题
+
+在这个方案中，他确实可以使用对应路径的拦截，同时刷新登录token令牌的存活时间，但是现在这个拦截器他**只是拦截需要被拦截的路**
+
+**径，假设当前用户访问了一些不需要拦截的路径，那么这个拦截器就不会生效，所以此时令牌刷新的动作实际上就不会执行**，所以这个方
+
+案他是存在问题的。
+
+![image-20220918011847052](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209180118126.png)
+
+#### 1.8.2 优化方案
+
+既然之前的拦截器无法对不需要拦截的路径生效，那么我们可以添加一个拦截器，在**第一个拦截器中拦截所有的路径**，把**第二个拦截器做**
+
+**的事情放入到第一个拦截器中，同时刷新令牌**，因为第一个拦截器有了threadLocal的数据，所以此时第二个拦截器只需要判断拦截器中
+
+的user对象是否存在即可，完成整体刷新功能。
+
+![image-20220918011955189](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209180119249.png)
+
+核心代码：
+
+```java
+public class RefreshTokenInterceptor implements HandlerInterceptor {
+    
+    private StringRedisTemplate stringRedisTemplate;
+
+    public RefreshTokenInterceptor(StringRedisTemplate stringRedisTemplate) {
+        this.stringRedisTemplate = stringRedisTemplate;
+    }
+
+    @Override
+    public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) throws Exception {
+        // 1.获取请求头中的token
+        String token = request.getHeader("authorization");
+        if (StrUtil.isBlank(token)) {
+            // 放行
+            return true;
+        }
+        // 2.基于TOKEN获取redis中的用户
+        String key = RedisConstants.LOGIN_USER_KEY + token;
+        Map<Object, Object> userMap = stringRedisTemplate.opsForHash().entries(key);
+        // 3.判断用户是否存在
+        if (userMap.isEmpty()) {
+            return true;
+        }
+        // 5.将查询到的hash数据转为UserDTO
+        UserDTO userDTO = BeanUtil.fillBeanWithMap(userMap, new UserDTO(), false);
+        // 6.存在，保存用户信息到 ThreadLocal
+        UserHolder.saveUser(userDTO);
+        // 7.刷新token有效期
+        stringRedisTemplate.expire(key, RedisConstants.LOGIN_USER_TTL, TimeUnit.MINUTES);
+        // 8.放行
+        return true;
+    }
+
+    @Override
+    public void afterCompletion(HttpServletRequest request, HttpServletResponse response, Object handler, Exception ex) throws Exception {
+        // 移除用户
+        UserHolder.removeUser();
+    }
+}
+```
+
