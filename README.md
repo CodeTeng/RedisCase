@@ -1,7 +1,7 @@
 # RedisCase
 详细介绍了Redis的基础与高级的语法，包括集群，哨兵，雪崩，击穿等等，并且还包含了一些Redis的典型案例
 
-# Redis
+# Redis基础篇
 
 ## 1. Redis入门 
 
