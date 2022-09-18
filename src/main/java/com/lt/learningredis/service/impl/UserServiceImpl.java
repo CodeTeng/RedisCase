@@ -15,13 +15,18 @@ import com.lt.learningredis.mapper.UserMapper;
 import com.lt.learningredis.service.IUserService;
 import com.lt.learningredis.utils.RegexUtils;
 import com.lt.learningredis.constant.SystemConstants;
+import com.lt.learningredis.utils.UserHolder;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.connection.BitFieldSubCommands;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.Resource;
 import javax.servlet.http.HttpSession;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
@@ -31,7 +36,6 @@ import java.util.concurrent.TimeUnit;
  * 服务实现类
  *
  * @author teng
- * @since 2021-12-22
  */
 @Slf4j
 @Service
@@ -111,5 +115,59 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
         // 4. 模拟发送验证码
         log.debug("短信验证码为：{}", code);
         return Result.ok();
+    }
+
+    @Override
+    public Result sign() {
+        // 1. 获取当前登录用户
+        UserDTO userDTO = UserHolder.getUser();
+        Long userId = userDTO.getId();
+        // 2. 获取日期
+        LocalDateTime now = LocalDateTime.now();
+        // 3. 拼接key
+        String keySuffix = now.format(DateTimeFormatter.ofPattern(":yyyyMM"));
+        String key = RedisConstants.USER_SIGN_KEY + userId + keySuffix;
+        // 4. 获取今天是本月的第几天
+        int day = now.getDayOfMonth();
+        // 5. 写入redis
+        stringRedisTemplate.opsForValue().setBit(key, day - 1, true);
+        return Result.ok();
+    }
+
+    @Override
+    public Result signCount() {
+        // 1. 获取当前登录用户
+        Long userId = UserHolder.getUser().getId();
+        // 2. 得到该用户本月到今天所有的签到数据
+        LocalDateTime now = LocalDateTime.now();
+        String keySuffix = now.format(DateTimeFormatter.ofPattern(":yyyyMM"));
+        String key = RedisConstants.USER_SIGN_KEY + userId + keySuffix;
+        int day = now.getDayOfMonth();
+        // BITFIELD sign:6:202209 GET u18 0
+        List<Long> result = stringRedisTemplate.opsForValue().bitField(key, BitFieldSubCommands.create()
+                .get(BitFieldSubCommands.BitFieldType.unsigned(day)).valueAt(0));
+        if (result == null || result.isEmpty()) {
+            // 没有任何签到结果
+            return Result.ok(0);
+        }
+        Long num = result.get(0);
+        if (num == null || num == 0) {
+            return Result.ok(0);
+        }
+        // 3. 从后开始遍历bit位
+        int count = 0;
+        while (true) {
+            // 让这个数字与1做&运算，得到最后一个数字的bit位
+            if ((num & 1) == 0) {
+                // 为0
+                break;
+            } else {
+                // 不为0 说明已签到
+                count++;
+            }
+            // 让数字右移一位
+            num >>>= 1;
+        }
+        return Result.ok(count);
     }
 }

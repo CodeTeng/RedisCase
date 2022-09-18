@@ -1,17 +1,17 @@
 package com.lt.learningredis.service;
 
 import com.baomidou.mybatisplus.extension.service.IService;
+import com.lt.learningredis.dto.Result;
 import com.lt.learningredis.entity.Shop;
 
+
 /**
- * <p>
- * 服务类
- * </p>
- *
- * @author 虎哥
- * @since 2021-12-22
+ * @author teng
  */
 public interface IShopService extends IService<Shop> {
 
 
+    Result queryShopById(Long id);
+
+    Result updateShop(Shop shop);
 }
