@@ -12,12 +12,7 @@ import java.io.Serializable;
 import java.time.LocalDateTime;
 
 /**
- * <p>
- * 
- * </p>
- *
- * @author 虎哥
- * @since 2021-12-22
+ * @author teng
  */
 @Data
 @EqualsAndHashCode(callSuper = false)
@@ -59,6 +54,4 @@ public class ShopType implements Serializable {
      */
     @JsonIgnore
     private LocalDateTime updateTime;
-
-
 }
