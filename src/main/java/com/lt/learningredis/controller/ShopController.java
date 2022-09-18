@@ -10,14 +10,11 @@ import com.lt.learningredis.constant.SystemConstants;
 import org.springframework.web.bind.annotation.*;
 
 import javax.annotation.Resource;
+import java.util.Objects;
+
 
 /**
- * <p>
- * 前端控制器
- * </p>
- *
- * @author 虎哥
- * @since 2021-12-22
+ * @author teng
  */
 @RestController
 @RequestMapping("/shop")
@@ -34,7 +31,10 @@ public class ShopController {
      */
     @GetMapping("/{id}")
     public Result queryShopById(@PathVariable("id") Long id) {
-        return Result.ok(shopService.getById(id));
+        if (id == null || id <= 0) {
+            return Result.fail("查询失败");
+        }
+        return shopService.queryShopById(id);
     }
 
     /**
@@ -59,9 +59,11 @@ public class ShopController {
      */
     @PutMapping
     public Result updateShop(@RequestBody Shop shop) {
-        // 写入数据库
-        shopService.updateById(shop);
-        return Result.ok();
+        Long id = shop.getId();
+        if (id == null || id < 0) {
+            return Result.fail("店铺id非法");
+        }
+        return shopService.updateShop(shop);
     }
 
     /**

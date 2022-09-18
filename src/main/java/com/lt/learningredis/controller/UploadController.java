@@ -12,12 +12,15 @@ import java.io.File;
 import java.io.IOException;
 import java.util.UUID;
 
+/**
+ * @author teng
+ */
 @Slf4j
 @RestController
-@RequestMapping("upload")
+@RequestMapping("/upload")
 public class UploadController {
 
-    @PostMapping("blog")
+    @PostMapping("/blog")
     public Result uploadImage(@RequestParam("file") MultipartFile image) {
         try {
             // 获取原始文件名称
