@@ -4,10 +4,12 @@ import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
+import com.lt.learningredis.dto.RedisData;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
+import javax.annotation.Resource;
 import java.time.LocalDateTime;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -17,22 +19,40 @@ import java.util.function.Function;
 import static com.lt.learningredis.constant.RedisConstants.CACHE_NULL_TTL;
 import static com.lt.learningredis.constant.RedisConstants.LOCK_SHOP_KEY;
 
+/**
+ * redis工具类
+ *
+ * @author teng
+ */
 @Slf4j
 @Component
 public class CacheClient {
 
-    private final StringRedisTemplate stringRedisTemplate;
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
 
     private static final ExecutorService CACHE_REBUILD_EXECUTOR = Executors.newFixedThreadPool(10);
 
-    public CacheClient(StringRedisTemplate stringRedisTemplate) {
-        this.stringRedisTemplate = stringRedisTemplate;
-    }
-
+    /**
+     * 设置key-value
+     *
+     * @param key   key
+     * @param value value
+     * @param time  过期时间
+     * @param unit  单位
+     */
     public void set(String key, Object value, Long time, TimeUnit unit) {
         stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(value), time, unit);
     }
 
+    /**
+     * 设置逻辑过期时间
+     *
+     * @param key   key
+     * @param value value
+     * @param time  逻辑过期时间
+     * @param unit  单位
+     */
     public void setWithLogicalExpire(String key, Object value, Long time, TimeUnit unit) {
         // 设置逻辑过期
         RedisData redisData = new RedisData();
@@ -42,6 +62,16 @@ public class CacheClient {
         stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(redisData));
     }
 
+    /**
+     * 解决缓存穿透
+     *
+     * @param keyPrefix  key的前缀
+     * @param id         id
+     * @param type       返回类型
+     * @param dbFallback 查询数据库逻辑函数
+     * @param time       过期时间
+     * @param unit       单位
+     */
     public <R, ID> R queryWithPassThrough(
             String keyPrefix, ID id, Class<R> type, Function<ID, R> dbFallback, Long time, TimeUnit unit) {
         String key = keyPrefix + id;
@@ -57,7 +87,6 @@ public class CacheClient {
             // 返回一个错误信息
             return null;
         }
-
         // 4.不存在，根据id查询数据库
         R r = dbFallback.apply(id);
         // 5.不存在，返回错误
@@ -72,6 +101,16 @@ public class CacheClient {
         return r;
     }
 
+    /**
+     * 利用逻辑过期解决缓存击穿
+     *
+     * @param keyPrefix  前缀
+     * @param id         id
+     * @param type       返回类型
+     * @param dbFallback 查询数据库函数
+     * @param time       逻辑过期时间
+     * @param unit       单位
+     */
     public <R, ID> R queryWithLogicalExpire(
             String keyPrefix, ID id, Class<R> type, Function<ID, R> dbFallback, Long time, TimeUnit unit) {
         String key = keyPrefix + id;
@@ -117,6 +156,16 @@ public class CacheClient {
         return r;
     }
 
+    /**
+     * 利用互斥锁解决缓存击穿
+     *
+     * @param keyPrefix  前缀
+     * @param id         id
+     * @param type       返回类型
+     * @param dbFallback 查询数据库函数
+     * @param time       过期时间
+     * @param unit       单位
+     */
     public <R, ID> R queryWithMutex(
             String keyPrefix, ID id, Class<R> type, Function<ID, R> dbFallback, Long time, TimeUnit unit) {
         String key = keyPrefix + id;
@@ -132,7 +181,6 @@ public class CacheClient {
             // 返回一个错误信息
             return null;
         }
-
         // 4.实现缓存重建
         // 4.1.获取互斥锁
         String lockKey = LOCK_SHOP_KEY + id;
