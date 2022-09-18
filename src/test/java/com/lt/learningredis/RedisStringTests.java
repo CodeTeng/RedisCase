@@ -3,6 +3,8 @@ package com.lt.learningredis;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.lt.learningredis.pojo.User;
+import com.lt.learningredis.service.IShopService;
+import com.lt.learningredis.service.impl.ShopServiceImpl;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -19,6 +21,9 @@ public class RedisStringTests {
     private StringRedisTemplate stringRedisTemplate;
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
+
+    @Autowired
+    private ShopServiceImpl shopService;
 
     @Test
     void testSaveUser() throws JsonProcessingException {
@@ -38,5 +43,10 @@ public class RedisStringTests {
         stringRedisTemplate.opsForValue().set("name", "小腾");
         String name = stringRedisTemplate.opsForValue().get("name");
         System.out.println(name);
+    }
+
+    @Test
+    void testSaveShop() {
+        shopService.saveShopToRedis(1L, 10L);
     }
 }
