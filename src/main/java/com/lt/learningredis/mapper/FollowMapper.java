@@ -2,15 +2,13 @@ package com.lt.learningredis.mapper;
 
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
 import com.lt.learningredis.entity.Follow;
+import org.springframework.stereotype.Repository;
 
 /**
- * <p>
- *  Mapper 接口
- * </p>
- *
- * @author 虎哥
- * @since 2021-12-22
+ * @description:
+ * @author: ~Teng~
+ * @date: 2022/9/19 17:00
  */
+@Repository
 public interface FollowMapper extends BaseMapper<Follow> {
-
 }
