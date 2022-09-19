@@ -1,9 +1,11 @@
 package com.lt.learningredis.controller;
 
 
+import cn.hutool.core.bean.BeanUtil;
 import com.lt.learningredis.dto.LoginFormDTO;
 import com.lt.learningredis.dto.Result;
 import com.lt.learningredis.dto.UserDTO;
+import com.lt.learningredis.entity.User;
 import com.lt.learningredis.entity.UserInfo;
 import com.lt.learningredis.service.IUserInfoService;
 import com.lt.learningredis.service.IUserService;
@@ -13,6 +15,7 @@ import org.springframework.web.bind.annotation.*;
 
 import javax.annotation.Resource;
 import javax.servlet.http.HttpSession;
+import java.util.Optional;
 
 /**
  * 前端控制器
@@ -100,5 +103,18 @@ public class UserController {
     @GetMapping("/sign/count")
     public Result signCount() {
         return userService.signCount();
+    }
+
+    @GetMapping("/{id}")
+    public Result queryUserById(@PathVariable("id") Long userId) {
+        if (userId == null || userId <= 0) {
+            return Result.fail("查询失败");
+        }
+        User user = userService.getById(userId);
+        if (user == null) {
+            return Result.fail("未查询到该用户");
+        }
+        UserDTO userDTO = BeanUtil.copyProperties(user, UserDTO.class);
+        return Result.ok(userDTO);
     }
 }

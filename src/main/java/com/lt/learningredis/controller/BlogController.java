@@ -24,19 +24,13 @@ public class BlogController {
     private IBlogService blogService;
 
     /**
-     * 保存笔记
+     * 保存笔记并发送给粉丝
      *
      * @param blog 笔记
      */
     @PostMapping
     public Result saveBlog(@RequestBody Blog blog) {
-        // 获取登录用户
-        UserDTO user = UserHolder.getUser();
-        blog.setUserId(user.getId());
-        // 保存探店博文
-        blogService.save(blog);
-        // 返回id
-        return Result.ok(blog.getId());
+        return blogService.saveBlog(blog);
     }
 
     /**
@@ -94,5 +88,38 @@ public class BlogController {
             return Result.fail("查询失败");
         }
         return blogService.queryBlogLikes(id);
+    }
+
+    /**
+     * 查看个人探店笔记
+     *
+     * @param id      用户id
+     * @param current 当前页
+     */
+    @GetMapping("/of/user")
+    public Result queryBlogByUserId(
+            @RequestParam(value = "id") Long id,
+            @RequestParam(value = "current", defaultValue = "1") Integer current) {
+        if (id == null || id <= 0) {
+            return Result.fail("查询失败");
+        }
+        Page<Blog> page = blogService.query().eq("user_id", id).page(new Page<>(current, SystemConstants.DEFAULT_PAGE_SIZE));
+        return Result.ok(page.getRecords());
+    }
+
+    /**
+     * 获取关注中的Blog信息
+     *
+     * @param max    上一次查询的最小时间戳
+     * @param offset 偏移量
+     * @return 小于指定时间戳的Blog笔记集合和本次查询推送的最小时间戳、偏移量
+     */
+    @GetMapping("/of/follow")
+    public Result queryBlogOfFollow(@RequestParam("lastId") Long max,
+                                    @RequestParam(value = "offset", defaultValue = "0") Integer offset) {
+        if (max == null || max <= 0) {
+            return Result.fail("获取失败！");
+        }
+        return blogService.queryBlogOfFollow(max, offset);
     }
 }
