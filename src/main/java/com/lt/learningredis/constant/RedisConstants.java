@@ -24,4 +24,10 @@ public interface RedisConstants {
     String CACHE_BLOG_LIKED = "blog:liked:";
 
     String USER_SIGN_KEY = "sign:";
+
+    String SHOP_GEO_KEY = "shop:geo:";
+
+    String FOLLOW_USER_KEY = "follow:user:";
+
+    String FEED_FOLLOW_KEY = "feed:follow:";
 }
