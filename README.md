@@ -866,9 +866,9 @@ private Shop queryWithLogicalExpire(Long id) {
 
 详情见 `CacheClient.java` 中查找
 
-## 4. 达人探店
+## 8. 达人探店
 
-### 4.1 点赞功能
+### 8.1 点赞功能
 
 初始代码
 
@@ -929,7 +929,7 @@ public Result likeBlog(Long id) {
 }
 ```
 
-### 4.2 点赞排行榜
+### 8.2 点赞排行榜
 
 ![image-20220918192208034](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209181922207.png)
 
@@ -957,6 +957,372 @@ public Result queryBlogLikes(Long id) {
 ```
 
 > 注意：为什么SQL语句里面要用filed...这是因为MySQL在查询时会进行优化，会将in(6,1)优化为in(1,6)，所以我们需要自定义field
+
+## 9. 好友关注
+
+### 9.1 关注和取关
+
+![image-20220919165327729](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209191653890.png)
+
+涉及到的数据库表
+
+```sql
+create table tb_follow
+(
+    id             bigint auto_increment comment '主键'
+        primary key,
+    user_id        bigint unsigned                     not null comment '用户id',
+    follow_user_id bigint unsigned                     not null comment '关联的用户id',
+    create_time    timestamp default CURRENT_TIMESTAMP not null comment '创建时间'
+)
+    collate = utf8mb4_general_ci;
+```
+
+### 9.2 共同关注
+
+实现共同关注，我们需要首先查看其他人的首页，能查看他人的个人信息和探店笔记。
+
+![image-20220919171535861](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209191715956.png)
+
+共同关注功能
+
+![image-20220919171637422](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209191716485.png)
+
+当然是使用我们之前学习过的**set集合**咯，在set集合中，**有交集并集补集的api**，我们可以把两人的关注的人分别放入到一个set集合中，
+
+然后再通过api去查看这两个set集合中的交集数据。
+
+我们先来改造当前的关注列表，改造原因是因为我们需要在用户关注了某位用户后，需要将数据放入到set集合中，方便后续进行共同关
+
+注，同时当取消关注时，也需要从set集合中进行删除。
+
+核心代码：
+
+```java
+public Result followCommons(Long targetUserId) {
+    // 1. 获取登录用户
+    Long userId = UserHolder.getUser().getId();
+    String myUserKey = RedisConstants.FOLLOW_USER_KEY + userId;
+    String targetUserKey = RedisConstants.FOLLOW_USER_KEY + targetUserId;
+    // 2. 求交集
+    Set<String> intersect = stringRedisTemplate.opsForSet().intersect(myUserKey, targetUserKey);
+    if (intersect == null || intersect.isEmpty()) {
+        // 无共同关注
+        return Result.ok(Collections.emptyList());
+    }
+    // 3. 解析id集合
+    List<Long> ids = intersect.stream().map(Long::valueOf).toList();
+    // 4. 查询用户
+    List<UserDTO> userDTOList = userMapper.selectBatchIds(ids).stream()
+        .map(user -> BeanUtil.copyProperties(user, UserDTO.class)).toList();
+    return Result.ok(userDTOList);
+}
+```
+
+### 9.3 关注推送
+
+#### 9.3.1 Feed流实现方案
+
+当我们关注了用户后，这个用户发了动态，那么我们应该**把这些数据推送给用户**，这个需求，其实我们又把他叫做**Feed流**，关注推送也
+
+叫做Feed流，直译为投喂。为用户持续的提供“沉浸式”的体验，通过无限下拉刷新获取新的信息。例如抖音。
+
+对于**传统的模式**的内容解锁：我们是需要用户去通过**搜索引擎**或者是其他的方式去解锁想要看的内容
+
+![image-20220919180912066](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209191809112.png)
+
+对于新型的**Feed流**的的效果：不需要我们用户再去推送信息，而是系统分析用户到底想要什么，然后直接把内容推送给用户，从而使用
+
+户能够更加的节约时间，不用主动去寻找。
+
+![image-20220919180931447](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209191809493.png)
+
+Feed流产品有两种常见模式：
+
+**Timeline**：不做内容筛选，简单的按照内容发布时间排序，常用于好友或关注。例如朋友圈。
+
+* 优点：信息全面，不会有缺失。并且实现也相对简单
+* 缺点：信息噪音较多，用户不一定感兴趣，内容获取效率低
+
+**智能排序**：利用智能算法屏蔽掉违规的、用户不感兴趣的内容。推送用户感兴趣信息来吸引用户
+
+* 优点：投喂用户感兴趣信息，用户粘度很高，容易沉迷
+* 缺点：如果算法不精准，可能起到反作用
+
+我们本次针对好友的操作，采用的就是Timeline的方式，只需要拿到我们关注用户的信息，然后按照时间排序即可，因此采用Timeline的
+
+模式。该模式的实现方案有三种：
+
+* 拉模式
+* 推模式
+* 推拉结合
+
+**拉模式**：也叫做读扩散
+
+该模式的核心含义就是：当张三和李四和王五发了消息后，都会保存在自己的邮箱中，假设赵六要读取信息，那么他会从读取他自己的收
+
+件箱，此时系统会从他关注的人群中，把他关注人的信息全部都进行拉取，然后在进行排序。
+
+优点：比较节约空间，因为赵六在读信息时，并没有重复读取，而且读取完之后可以把他的收件箱进行清楚。
+
+缺点：比较延迟，当用户读取数据时才去关注的人里边去读取数据，假设用户关注了大量的用户，那么此时就会拉取海量的内容，对服务器压力巨大。
+
+![image-20220919181235518](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209191812586.png)
+
+**推模式**：也叫做写扩散。
+
+推模式是没有写邮箱的，当张三写了一个内容，此时会主动的把张三写的内容发送到他的粉丝收件箱中去，假设此时李四再来读取，就不用再去临时拉取了。
+
+优点：时效快，不用临时拉取
+
+缺点：内存压力大，假设一个大V写信息，很多人关注他， 就会写很多分数据到粉丝那边去
+
+![image-20220919181307146](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209191813231.png)
+
+**推拉结合模式**：也叫做读写混合，兼具推和拉两种模式的优点。
+
+推拉模式是一个折中的方案，站在**发件人**这一段，如果是个**普通的人**，那么我们采用写扩散的方式，直接把数据写入到他的粉丝中去，因
+
+为普通的人他的粉丝关注量比较小，所以这样做没有压力；如果是**大V**，那么他是直接将数据先写入到一份到发件箱里边去，然后再直接
+
+写一份到活跃粉丝收件箱里边去。现在站在**收件人**这端来看，如果是**活跃粉丝**，那么大V和普通的人发的都会直接写入到自己收件箱里边
+
+来，而如果是**普通的粉丝**，由于他们上线不是很频繁，所以等他们上线时，再从发件箱里边去拉信息。
+
+![image-20220919181519269](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209191815347.png)
+
+三者对比
+
+![image-20220919181659898](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209191816955.png)
+
+#### 9.3.2 基于推模式-推送到粉丝收件箱
+
+需求：
+
+* 修改新增探店笔记的业务，在保存blog到数据库的同时，推送到粉丝的收件箱
+* 收件箱满足可以根据时间戳排序，必须用Redis的数据结构实现
+* 查询收件箱数据时，可以实现分页查询
+
+**Feed流中的数据会不断更新，所以数据的角标也在变化，因此不能采用传统的分页模式。**
+
+传统了分页在feed流是不适用的，因为我们的数据会随时发生变化
+
+假设在t1 时刻，我们去读取第一页，此时page = 1 ，size = 5 ，那么我们拿到的就是10~6 这几条记录，假设现在t2时候又发布了一条记录，此时t3 时刻，我们来读取第二页，读取第二页传入的参数是page=2 ，size=5 ，那么此时读取到的第二页实际上是从6 开始，然后是6~2 ，那么我们就读取到了重复的数据，所以feed流的分页，不能采用原始方案来做。
+
+![image-20220919184644335](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209191846405.png)
+
+Feed流的滚动分页
+
+我们需要记录每次操作的最后一条，然后从这个位置开始去读取数据
+
+举个例子：我们从t1时刻开始，拿第一页数据，拿到了10~6，然后记录下当前最后一次拿取的记录，就是6，t2时刻发布了新的记录，此时这个11放到最顶上，但是不会影响我们之前记录的6，此时t3时刻来拿第二页，第二页这个时候拿数据，还是从6后一点的5去拿，就拿到了5-1的记录。我们这个地方可以采用**sortedSet**来做，可以进行范围查询，并且还可以记录当前获取数据时间戳最小值，就可以实现滚动分页了。
+
+![image-20220919184701425](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209191847493.png)
+
+推送粉丝到redis核心代码：
+
+```java
+public Result saveBlog(Blog blog) {
+    // 1. 获取登录用户
+    UserDTO user = UserHolder.getUser();
+    blog.setUserId(user.getId());
+    // 2. 保存探店博文
+    boolean isSuccess = this.save(blog);
+    if (!isSuccess) {
+        return Result.fail("新增笔记失败!");
+    }
+    // 3. 查询作者所有的粉丝 select user_id from tb_follow where follow_user_id = ?
+    List<Follow> follows = followMapper.selectList(new QueryWrapper<Follow>().eq("follow_user_id", user.getId()).select("user_id"));
+    // 4. 发送给粉丝
+    follows.forEach(follow -> {
+        String key = RedisConstants.FEED_FOLLOW_KEY + follow.getUserId();
+        stringRedisTemplate.opsForZSet().add(key, blog.getId().toString(), System.currentTimeMillis());
+    });
+    // 5. 返回id
+    return Result.ok(blog.getId());
+}
+```
+
+#### 9.3.3 实现分页查询收邮箱
+
+需求：在个人主页的“关注”卡片中，查询并展示推送的Blog信息：
+
+具体操作如下：
+
+1、每次查询完成后，我们要分析出查询出数据的最小时间戳，这个值会作为下一次查询的条件
+
+2、我们需要找到与上一次查询相同的查询个数作为偏移量，下次查询时，跳过这些查询过的数据，拿到我们需要的数据
+
+综上：我们的请求参数中就需要携带 lastId：上一次查询的最小时间戳 和偏移量这两个参数。
+
+这两个参数第一次会由前端来指定，以后的查询就根据后台结果作为条件，再次传递到后台。
+
+![image-20220919184846521](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209191848592.png)
+
+![image-20220919203852954](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209192038035.png)
+
+核心代码：
+
+```java
+public Result queryBlogOfFollow(Long max, Integer offset) {
+    // 1. 获取当前用户
+    Long userId = UserHolder.getUser().getId();
+    // 2. 查询收件箱 ZREVRANGEBYSCORE key Max Min LIMIT offset count
+    String key = RedisConstants.FEED_FOLLOW_KEY + userId;
+    Set<ZSetOperations.TypedTuple<String>> typedTuples = stringRedisTemplate.opsForZSet()
+        .reverseRangeByScoreWithScores(key, 0, max, offset, 2);
+    if (typedTuples == null || typedTuples.isEmpty()) {
+        return Result.ok();
+    }
+    // 3. 解析数据：blogId、score---minTime(时间戳)、offset
+    List<Long> ids = new ArrayList<>(typedTuples.size());
+    long minTime = 0;
+    int finalOffset = 1;
+    for (ZSetOperations.TypedTuple<String> typedTuple : typedTuples) {
+        // 3.1 获取blogId集合
+        ids.add(Long.valueOf(typedTuple.getValue()));
+        // 3.2 获取时间戳(分数)
+        long time = typedTuple.getScore().longValue();
+        if (minTime == time) {
+            finalOffset++;
+        } else {
+            // 不是最小的 重置
+            minTime = time;
+            finalOffset = 1;
+        }
+    }
+    // 4. 根据id查询blog
+    String idStr = StrUtil.join(",", ids);
+    // 不能直接in，因为MySQL会进行优化
+    List<Blog> blogs = this.query().in("id", ids).last("order by field(id," + idStr + ")").list();
+    blogs.forEach(blog -> {
+        // 4.1 查询blog有关的用户
+        this.queryBlogUser(blog);
+        // 4.2 查询blog是否被点赞
+        this.isBlogLiked(blog);
+    });
+    // 5. 封装并返回
+    ScrollResult scrollResult = new ScrollResult();
+    scrollResult.setList(blogs);
+    scrollResult.setOffset(finalOffset);
+    scrollResult.setMinTime(minTime);
+    return Result.ok(scrollResult);
+}
+```
+
+## 10. 附近商户
+
+### 10.1 GEO数据结构的基本用法
+
+GEO就是Geolocation的简写形式，代表**地理坐标**。Redis在3.2版本中加入了对GEO的支持，允许存储地理坐标信息，帮助我们根据经纬
+
+度来检索数据。常见的命令有：
+
+* **GEOADD**：添加一个地理空间信息，包含：经度（longitude）、纬度（latitude）、值（member）
+* **GEODIST**：计算指定的两个点之间的距离并返回
+* GEOHASH：将指定member的坐标转为hash字符串形式并返回
+* **GEOPOS**：返回指定member的坐标
+* GEORADIUS：指定圆心、半径，找到该圆内包含的所有member，并按照与圆心之间的距离排序后返回。6.以后已废弃
+* **GEOSEARCH**：在指定范围内搜索member，并按照与指定点之间的距离排序后返回。范围可以是圆形或矩形。6.2.新功能
+* GEOSEARCHSTORE：与GEOSEARCH功能一致，不过可以把结果存储到一个指定的key。 6.2.新功能
+
+### 10.2 实现附近商户功能
+
+![image-20220919094545851](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209190945104.png)
+
+当我们点击美食之后，会出现一系列的商家，商家中可以按照多种排序方式，我们此时关注的是距离，这个地方就需要使用到我们的
+
+GEO，向后台传入当前app收集的地址(我们此处是写死的) ，以当前坐标作为圆心，同时绑定相同的店家类型type，以及分页信息，把这
+
+几个条件传入后台，后台查询出对应的数据再返回。
+
+![image-20220919094747035](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209190947126.png)
+
+我们要做的事情是：将数据库表中的数据导入到redis中去，redis中的GEO，GEO在redis中就一个menber和一个经纬度，我们把x和y轴
+
+传入到redis做的经纬度位置去，但我们不能把所有的数据都放入到menber中去，毕竟作为redis是一个内存级数据库，如果存海量数
+
+据，redis还是力不从心，所以我们在这个地方存储他的id即可。
+
+但是这个时候还有一个问题，就是在redis中并没有存储type，所以我们无法根据type来对数据进行筛选，所以我们可以按照商户类型做
+
+分组，类型相同的商户作为同一组，以typeId为key存入同一个GEO集合中即可。
+
+将数据存入redis代码
+
+```java
+void loadShopData() {
+    // 1. 查询店铺信息
+    List<Shop> shopList = shopService.list();
+    // 2. 把店铺分组，按照typeId分组，typeId一致的放到一个集合
+    Map<Long, List<Shop>> map = shopList.stream().collect(Collectors.groupingBy(Shop::getTypeId));
+    // 3. 存入redis中 geoadd key 经度 维度 member
+    for (Map.Entry<Long, List<Shop>> entry : map.entrySet()) {
+        // 3.1.获取类型id
+        Long typeId = entry.getKey();
+        String key = RedisConstants.SHOP_GEO_KEY + typeId;
+        // 3.2.获取同类型的店铺的集合
+        List<Shop> value = entry.getValue();
+        List<RedisGeoCommands.GeoLocation<String>> locations = new ArrayList<>();
+        for (Shop shop : value) {
+            // 效率比较低--->改为批量插入
+            // stringRedisTemplate.opsForGeo().add(key, new Point(shop.getX(), shop.getY()), shop.getId().toString());
+            locations.add(new RedisGeoCommands.GeoLocation<>(shop.getId().toString(), new Point(shop.getX(), shop.getY())));
+        }
+        stringRedisTemplate.opsForGeo().add(key, locations);
+    }
+}
+```
+
+业务核心代码：
+
+```java
+public Result queryShopByType(Integer typeId, Integer current, Double x, Double y) {
+    // 1. 判断是否需要根据坐标查询
+    if (x == null || y == null) {
+        // 不需要坐标查询，按数据库查询
+        Page<Shop> page = this.query().eq("type_id", typeId).page(new Page<>(current, SystemConstants.DEFAULT_PAGE_SIZE));
+        return Result.ok(page.getRecords());
+    }
+    // 2. 计算分页参数
+    int from = (current - 1) * SystemConstants.DEFAULT_PAGE_SIZE;
+    int end = current * SystemConstants.DEFAULT_PAGE_SIZE;
+    // 3. 查询redis、按照距离排序、分页。结果：shopId,distance
+    String key = RedisConstants.SHOP_GEO_KEY + typeId;
+    // GEOSEARCH key BYLONLAT x y BYRADIUS 10 WITHDISTANCE
+    GeoResults<RedisGeoCommands.GeoLocation<String>> results = stringRedisTemplate.opsForGeo().search(key,
+                                                                                                      GeoReference.fromCoordinate(x, y), new Distance(5, Metrics.KILOMETERS),
+                                                                                                      RedisGeoCommands.GeoSearchCommandArgs.newGeoSearchArgs().includeDistance().limit(end));
+    // 4. 解析出id
+    if (results == null) {
+        return Result.ok(Collections.emptyList());
+    }
+    List<GeoResult<RedisGeoCommands.GeoLocation<String>>> list = results.getContent();
+    if (list.size() <= from) {
+        //  没有下一页了，结束
+        return Result.ok(Collections.emptyList());
+    }
+    // 4.1 截取 from ~ end的部分
+    List<Long> ids = new ArrayList<>(list.size());
+    Map<String, Distance> distanceMap = new HashMap<>(list.size());
+    list.stream().skip(from).forEach(result -> {
+        // 4.2 获取店铺id
+        String shopIdStr = result.getContent().getName();
+        ids.add(Long.valueOf(shopIdStr));
+        // 4.3 获取距离
+        Distance distance = result.getDistance();
+        distanceMap.put(shopIdStr, distance);
+    });
+    // 5. 根据id查询Shop
+    String idStr = StrUtil.join(",", ids);
+    List<Shop> shops = this.query().in("id", ids).last("order by field(id," + idStr + ")").list();
+    for (Shop shop : shops) {
+        shop.setDistance(distanceMap.get(shop.getId().toString()).getValue());
+    }
+    // 6. 返回
+    return Result.ok(shops);
+}
+```
 
 ## 11. 用户签到
 
