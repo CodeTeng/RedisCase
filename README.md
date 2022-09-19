@@ -1,7 +1,7 @@
 # RedisCase
 详细介绍了Redis的基础与高级的语法，包括集群，哨兵，雪崩，击穿等等，并且还包含了一些Redis的典型案例
 
-# Redis
+# Redis基础篇
 
 ## 1. Redis入门 
 
@@ -581,4 +581,550 @@ public class RefreshTokenInterceptor implements HandlerInterceptor {
     }
 }
 ```
+
+## 2. 商户查询缓存
+
+### 2.1 添加商户缓存
+
+![image-20220918105241145](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209181052283.png)
+
+核心代码：
+
+```java
+public Result queryShopById(Long id) {
+    // 1. 从redis中查询
+    String cacheShopJson = redisTemplate.opsForValue().get(RedisConstants.CACHE_SHOP_KEY + id);
+    // 2. 判断是否存在
+    if (StrUtil.isNotBlank(cacheShopJson)) {
+        Shop shop = JSONUtil.toBean(cacheShopJson, Shop.class);
+        return Result.ok(shop);
+    }
+    // 3. 不存在，根据id从数据库查询
+    Shop shop = this.getById(id);
+    // 4. 没有返回未查询到
+    if (Objects.isNull(shop)) {
+        return Result.fail("店铺不存在！");
+    }
+    // 5. 数据库中查询到，返回并存入缓存
+    redisTemplate.opsForValue().set(RedisConstants.CACHE_SHOP_KEY + id, JSONUtil.toJsonStr(shop));
+    return Result.ok(shop);
+}
+```
+
+### 2.2 缓存更新策略
+
+缓存更新是redis为了节约内存而设计出来的一个东西，主要是因为内存数据宝贵，当我们向redis插入太多数据，此时就可能会导致缓存
+
+中的数据过多，所以redis会对部分数据进行更新，或者把他叫为淘汰更合适。
+
+![image-20220918113332150](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209181133220.png)
+
+**主动更新策略**
+
+![image-20220918113734705](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209181137794.png)
+
+![image-20220918114102593](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209181141655.png)
+
+两种操作方案都有数据不一致性问题
+
+![image-20220918115048005](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209181150064.png)
+
+![image-20220918114911644](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209181149715.png)
+
+**缓存更新策略的最佳实践方案：**
+
+1. 低一致性需求：**使用Redis自带的内存淘汰机制**
+2. 高一致性需求：**主动更新，并以超时剔除作为兜底方案**
+    1. 读操作：
+        - 缓存命中则直接返回
+        - 缓存未命中则查询数据库，并写入缓存，设定超时时间
+    2. 写操作：
+        - **先写数据库，然后再删除缓存**
+        - 要确保数据库与缓存操作的**原子性**
+
+### 2.3 实现商铺和缓存与数据库双写一致
+
+核心思路如下：
+
+修改ShopController中的业务逻辑，满足下面的需求：
+
+- 根据id查询店铺时，如果缓存未命中，则查询数据库，将数据库结果写入缓存，并设置超时时间
+
+- 根据id修改店铺时，先修改数据库，再删除缓存
+
+核心代码：
+
+**查询修改---设置redis缓存时添加过期时间**
+
+```java
+stringRedisTemplate.opsForValue().set(RedisConstants.CACHE_SHOP_KEY + id, JSONUtil.toJsonStr(shop), RedisConstants.CACHE_SHOP_TTL, TimeUnit.MINUTES);
+```
+
+**更新修改---先修改数据库，再删除缓存**
+
+```java
+@Transactional
+public Result updateShop(Shop shop) {
+    // 1. 修改数据库
+    this.updateById(shop);
+    // 2. 删除缓存
+    stringRedisTemplate.delete(RedisConstants.CACHE_SHOP_KEY + shop.getId());
+    return Result.ok();
+}
+```
+
+### 2.4 缓存穿透
+
+**缓存穿透**是指客户端**请求的数据在缓存中和数据库中都不存在，这样缓存永远不会生效，这些请求都会打到数据库**。
+
+![image-20220918133842487](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209181338577.png)
+
+缓存空对象逻辑
+
+![image-20220918140857130](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209181408196.png)
+
+核心代码：
+
+```java
+public Result queryShopById(Long id) {
+        // 1. 从redis中查询
+    String cacheShopJson = stringRedisTemplate.opsForValue().get(RedisConstants.CACHE_SHOP_KEY + id);
+    // 2. 判断是否存在
+    if (StrUtil.isNotBlank(cacheShopJson)) {
+        Shop shop = JSONUtil.toBean(cacheShopJson, Shop.class);
+        return Result.ok(shop);
+    }
+    // 命中的是否是空值
+    if (cacheShopJson != null) {
+        return Result.fail("店铺信息不存在！");
+    }
+    // 3. 不存在，根据id从数据库查询
+    Shop shop = this.getById(id);
+    // 4. 没有返回未查询到
+    if (Objects.isNull(shop)) {
+        // 将空值写入redis
+        stringRedisTemplate.opsForValue().set(RedisConstants.CACHE_SHOP_KEY + id, "", RedisConstants.CACHE_NULL_TTL, TimeUnit.MINUTES);
+        return Result.fail("店铺不存在！");
+    }
+    // 5. 数据库中查询到，返回并存入缓存，并且设置超时时间
+    stringRedisTemplate.opsForValue().set(RedisConstants.CACHE_SHOP_KEY + id, JSONUtil.toJsonStr(shop), RedisConstants.CACHE_SHOP_TTL, TimeUnit.MINUTES);
+    return Result.ok(shop);
+}
+```
+
+小总结
+
+**缓存穿透产生的原因是什么？**
+
+* 用户请求的数据在缓存中和数据库中都不存在，不断发起这样的请求，给数据库带来巨大压力
+
+**缓存穿透的解决方案有哪些？**
+
+* 缓存空对象值
+* 布隆过滤
+* 增强id的复杂度，避免被猜测id规律
+* 做好数据的基础格式校验
+* 加强用户权限校验
+* 做好热点参数的限流
+
+### 2.5 缓存雪崩
+
+**缓存雪崩**是指在同一时段大量的缓存key同时失效或者Redis服务宕机，导致大量请求到达数据库，带来巨大压力。
+
+![image-20220918143023951](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209181430070.png)
+
+### 2.6 缓存击穿
+
+**缓存击穿问题**也叫**热点Key**问题，就是一个被**高并发访问**并且**缓存重建业务较复杂**的key突然失效了，无数的请求访问会在瞬间给数据库
+
+带来巨大的冲击。
+
+![image-20220918144408451](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209181444537.png)
+
+解决方案逻辑
+
+![image-20220918144628573](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209181446690.png)
+
+二者对比
+
+![image-20220918144644853](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209181446905.png)
+
+#### 2.6.1 互斥锁解决方案
+
+![image-20220918145120850](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209181451926.png)
+
+操作锁代码：
+
+```java
+/**
+ * 获取互斥锁
+ */
+private boolean tryLock(String key) {
+    Boolean flag = stringRedisTemplate.opsForValue().setIfAbsent(key, "1", 10L, TimeUnit.SECONDS);
+    // 不要直接返回，因为有自动拆箱-防止空指针
+    return BooleanUtil.isTrue(flag);
+}
+
+/**
+ * 释放互斥锁
+ */
+private void unlock(String key) {
+    stringRedisTemplate.delete(key);
+}
+```
+
+核心代码：
+
+```java
+private Shop queryWithMutex(Long id) {
+    // 1. 从redis中查询缓存
+    String key = RedisConstants.CACHE_SHOP_KEY + id;
+    String cacheShopJson = stringRedisTemplate.opsForValue().get(key);
+    if (StrUtil.isNotBlank(cacheShopJson)) {
+        // 命中 直接返回
+        return JSONUtil.toBean(cacheShopJson, Shop.class);
+    }
+    // 判断是否为空值
+    if (cacheShopJson != null) {
+        return null;
+    }
+    // 2. 获取互斥锁
+    String lockKey = RedisConstants.LOCK_SHOP_KEY + id;
+    Shop shop = null;
+    try {
+        boolean isLock = tryLock(lockKey);
+        if (!isLock) {
+            // 获取失败 休眠重试
+            Thread.sleep(50);
+            return queryWithMutex(id);
+        }
+        // 成功 根据id查询数据库
+        shop = this.getById(id);
+        // 3. 判断数据库中是否存在
+        if (Objects.isNull(shop)) {
+            // 不存在 存入空对象 防止缓存穿透
+            stringRedisTemplate.opsForValue().set(key, "", RedisConstants.CACHE_NULL_TTL, TimeUnit.MINUTES);
+            return null;
+        }
+        // 4. 查询到 写入redis中 并设置过期时间
+        stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(shop), RedisConstants.CACHE_SHOP_TTL, TimeUnit.MINUTES);
+    } catch (InterruptedException e) {
+        throw new RuntimeException(e);
+    } finally {
+        // 5. 释放互斥锁
+        unlock(lockKey);
+    }
+    return shop;
+}
+```
+
+#### 2.6.2 逻辑过期解决方案
+
+![image-20220918145129881](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209181451960.png)
+
+核心代码：
+
+```java
+private Shop queryWithLogicalExpire(Long id) {
+    String key = RedisConstants.CACHE_SHOP_KEY + id;
+    // 1. 从redis中查询
+    String redisDataJson = stringRedisTemplate.opsForValue().get(key);
+    if (StrUtil.isBlank(redisDataJson)) {
+        // 2. 不存在 直接返回空
+        return null;
+    }
+    // 3. 命中缓存 判断是否过期
+    RedisData redisData = JSONUtil.toBean(redisDataJson, RedisData.class);
+    JSONObject data = (JSONObject) redisData.getData();
+    Shop shop = JSONUtil.toBean(data, Shop.class);
+    LocalDateTime expireTime = redisData.getExpireTime();
+    if (expireTime.isAfter(LocalDateTime.now())) {
+        // 未过期
+        return shop;
+    }
+    // 4. 过期 获取互斥锁
+    String lockKey = RedisConstants.LOCK_SHOP_KEY + id;
+    boolean isLock = tryLock(lockKey);
+    if (isLock) {
+        // 获取成功 开启独立线程，实现缓存重建
+        CACHE_REBUILD_EXECUTOR.submit(() -> {
+            try {
+                this.saveShopToRedis(id, 20L);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            } finally {
+                // 释放锁
+                unlock(lockKey);
+            }
+        });
+    }
+    return shop;
+}
+```
+
+### 2.7 缓存工具封装
+
+详情见 `CacheClient.java` 中查找
+
+## 4. 达人探店
+
+### 4.1 点赞功能
+
+初始代码
+
+```java
+@GetMapping("/likes/{id}")
+public Result queryBlogLikes(@PathVariable("id") Long id) {
+    //修改点赞数量
+    blogService.update().setSql("liked = liked +1 ").eq("id",id).update();
+    return Result.ok();
+}
+```
+
+问题分析：这种方式会**导致一个用户无限点赞**，明显是不合理的
+
+造成这个问题的原因是，我们现在的逻辑，发起请求只是给数据库+1，所以才会出现这个问题
+
+完善点赞功能
+
+需求：
+
+* 同一个用户只能点赞一次，再次点击则取消点赞
+* 如果当前用户已经点赞，则点赞按钮高亮显示（前端已实现，判断字段Blog类的isLike属性）
+
+实现步骤：
+
+* 给Blog类中添加一个isLike字段，标示是否被当前用户点赞
+* 修改点赞功能，**利用Redis的set集合判断是否点赞过**，未点赞过则点赞数+1，已点赞过则点赞数-1
+* 修改根据id查询Blog的业务，判断当前登录用户是否点赞过，赋值给isLike字段
+* 修改分页查询Blog业务，判断当前登录用户是否点赞过，赋值给isLike字段
+
+核心代码：
+
+```java
+public Result likeBlog(Long id) {
+    // 1. 获取当前用户
+    Long userId = UserHolder.getUser().getId();
+    // 2. 判断该用户是否已经点赞
+    String key = RedisConstants.CACHE_BLOG_LIKED + id;
+    Double score = stringRedisTemplate.opsForZSet().score(key, userId.toString());
+    if (score == null) {
+        // 3. 如果未点赞，可以点赞
+        // 3.1 数据库点赞
+        boolean isSuccess = this.update().setSql("liked = liked + 1").eq("id", id).update();
+        if (isSuccess) {
+            // 3.2 保存用户到redis的set中--->保存到SortedSet
+            stringRedisTemplate.opsForZSet().add(key, userId.toString(), System.currentTimeMillis());
+        }
+    } else {
+        // 4. 已点赞，取消点赞
+        // 4.1 数据库点赞-1
+        boolean isSuccess = this.update().setSql("liked = liked - 1").eq("id", id).update();
+        if (isSuccess) {
+            // 4.2 用户从redis中移除
+            stringRedisTemplate.opsForZSet().remove(key, userId.toString());
+        }
+    }
+    return Result.ok();
+}
+```
+
+### 4.2 点赞排行榜
+
+![image-20220918192208034](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209181922207.png)
+
+核心代码：
+
+```java
+public Result queryBlogLikes(Long id) {
+    String key = RedisConstants.CACHE_BLOG_LIKED + id;
+    // 1. 查询top5的点赞用户
+    Set<String> top = stringRedisTemplate.opsForZSet().range(key, 0, 4);
+    if (top == null || top.isEmpty()) {
+        return Result.ok(Collections.emptyList());
+    }
+    // 2. 解析出其中的用户id
+    List<Long> userIdList = top.stream().map(Long::valueOf).collect(Collectors.toList());
+    String userIdStr = StrUtil.join(",", userIdList);
+    // 3. 根据用户id查询用户 where id in (6, 1) order by filed(id, 6, 1)
+    QueryWrapper<User> queryWrapper = new QueryWrapper<>();
+    queryWrapper.in("id", userIdList).last("order by field(id," + userIdStr + ")");
+    List<UserDTO> userDTOList = userMapper.selectList(queryWrapper)
+        .stream().map(user -> BeanUtil.copyProperties(user, UserDTO.class)).collect(Collectors.toList());
+    // 4. 返回
+    return Result.ok(userDTOList);
+}
+```
+
+> 注意：为什么SQL语句里面要用filed...这是因为MySQL在查询时会进行优化，会将in(6,1)优化为in(1,6)，所以我们需要自定义field
+
+## 11. 用户签到
+
+### 11.1 BitMap用法
+
+我们按月来统计用户签到信息，签到记录为1，未签到则记录为0.
+
+把**每一个bit位**对应当月的每一天，形成了映射关系。用0和1标示业务状态，这种思路就称为**位图（BitMap）**。这样我们就用极小的空
+
+间，来实现了大量数据的表示
+
+Redis中是利用string类型数据结构实现BitMap，因此**最大上限是512M**，转换为bit则是 2^32个bit位。
+
+![image-20220918210945655](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209182109709.png)
+
+BitMap的操作命令有：
+
+* SETBIT：向指定位置（offset）存入一个0或1
+* GETBIT ：获取指定位置（offset）的bit值
+* BITCOUNT ：统计BitMap中值为1的bit位的数量
+* BITFIELD ：操作（查询、修改、自增）BitMap中bit数组中的指定位置（offset）的值
+* BITFIELD_RO ：获取BitMap中bit数组，并以十进制形式返回
+* BITOP ：将多个BitMap的结果做位运算（与 、或、异或）
+* BITPOS ：查找bit数组中指定范围内第一个0或1出现的位置
+
+![image-20220918211955557](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209182119668.png)
+
+### 11.2 签到功能
+
+![image-20220918212225587](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209182122647.png)
+
+核心代码：
+
+```java
+public Result sign() {
+    // 1. 获取当前登录用户
+    UserDTO userDTO = UserHolder.getUser();
+    String nickName = userDTO.getNickName();
+    // 2. 获取日期
+    LocalDateTime now = LocalDateTime.now();
+    // 3. 拼接key
+    String keySuffix = now.format(DateTimeFormatter.ofPattern(":yyyyMM"));
+    String key = RedisConstants.USER_SIGN_KEY + nickName + keySuffix;
+    // 4. 获取今天是本月的第几天
+    int day = now.getDayOfMonth();
+    // 5. 写入redis
+    stringRedisTemplate.opsForValue().setBit(key, day - 1, true);
+    return Result.ok();
+}
+```
+
+### 11.3 签到统计
+
+**问题1：**什么叫做连续签到天数？
+
+从最后一次签到开始向前统计，直到遇到第一次未签到为止，计算总的签到次数，就是连续签到天数。
+
+![image-20220918214349314](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209182143374.png)
+
+Java逻辑代码：获得当前这个月的最后一次签到数据，定义一个计数器，然后不停的向前统计，直到获得第一个非0的数字即可，每得到
+
+一个非0的数字计数器+1，直到遍历完所有的数据，就可以获得当前月的签到总天数了
+
+**问题2：**如何得到本月到今天为止的所有签到数据？
+
+`BITFIELD key GET u[day] 0`
+
+假设今天是10号，那么我们就可以从当前月的第一天开始，获得到当前这一天的位数，是10号，那么就是10位，去拿这段时间的数据，
+
+就能拿到所有的数据了，那么这10天里边签到了多少次呢？统计有多少个1即可。
+
+**问题3：如何从后向前遍历每个bit位？**
+
+注意：bitMap返回的数据是10进制，哪假如说返回一个数字8，那么我哪儿知道到底哪些是0，哪些是1呢？我们只需要让得到的10进制
+
+数字**和1做与运算**就可以了，因为1只有遇见1才是1，其他数字都是0 ，我们把签到结果和1进行与操作，每与一次，就把**签到结果向右移**
+
+**动一位**，依次内推，我们就能完成逐个遍历的效果了。
+
+![image-20220918214450863](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209182144924.png)
+
+核心代码：
+
+```java
+public Result signCount() {
+    // 1. 获取当前登录用户
+    Long userId = UserHolder.getUser().getId();
+    // 2. 得到该用户本月到今天所有的签到数据
+    LocalDateTime now = LocalDateTime.now();
+    String keySuffix = now.format(DateTimeFormatter.ofPattern(":yyyyMM"));
+    String key = RedisConstants.USER_SIGN_KEY + userId + keySuffix;
+    int day = now.getDayOfMonth();
+    // BITFIELD sign:6:202209 GET u18 0
+    List<Long> result = stringRedisTemplate.opsForValue().bitField(key, BitFieldSubCommands.create()
+                                                                   .get(BitFieldSubCommands.BitFieldType.unsigned(day)).valueAt(0));
+    if (result == null || result.isEmpty()) {
+        // 没有任何签到结果
+        return Result.ok(0);
+    }
+    Long num = result.get(0);
+    if (num == null || num == 0) {
+        return Result.ok(0);
+    }
+    // 3. 从后开始遍历bit位
+    int count = 0;
+    while (true) {
+        // 让这个数字与1做&运算，得到最后一个数字的bit位
+        if ((num & 1) == 0) {
+            // 为0
+            break;
+        } else {
+            // 不为0 说明已签到
+            count++;
+        }
+        // 让数字右移一位
+        num >>>= 1;
+    }
+    return Result.ok(count);
+}
+```
+
+## 12. UV统计
+
+### 12.1 HyperLogLog用法
+
+* UV：全称Unique Visitor，也叫**独立访客量**，是指通过互联网访问、浏览这个网页的自然人。1天内同一个用户多次访问该网站，只记录1次。
+* PV：全称Page View，也叫**页面访问量或点击量**，用户每访问网站的一个页面，记录1次PV，用户多次打开页面，则记录多次PV。往往用来衡量网站的流量。
+
+通常来说UV会比PV大很多，所以衡量同一个网站的访问量，我们需要综合考虑很多因素，所以我们只是单纯的把这两个值作为一个参考
+
+值。
+
+UV统计在服务端做会比较麻烦，因为要判断该用户是否已经统计过了，需要将统计过的用户信息保存。但是如果每个访问的用户都保存
+
+到Redis中，数据量会非常恐怖，那怎么处理呢？
+
+`Hyperloglog(HLL)`是从`Loglog`算法派生的**概率算法**，**用于确定非常大的集合的基数，而不需要存储其所有值**。
+
+相关算法原理大家可以参考：https://juejin.cn/post/6844903785744056333#heading-0
+
+Redis中的HLL是基于string结构实现的，单个HLL的内存**永远小于16kb**，**内存占用低**的令人发指！作为代价，其测量结果是概率性的，**有**
+
+**小于0.81％的误差**。不过对于UV统计来说，这完全可以忽略。
+
+![image-20220918205056291](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209182050360.png)
+
+### 12.2 实现UV统计
+
+测试思路：我们直接利用单元测试，向HyperLogLog中添加100万条数据，看看内存占用和统计效果如何
+
+```java
+void testHyperLogLog() {
+    String[] values = new String[1000];
+    int j = 0;
+    for (int i = 0; i < 1000000; i++) {
+        j = i % 1000;
+        values[j] = "user_" + i;
+        if (j == 999) {
+            // 发送到redis中
+            stringRedisTemplate.opsForHyperLogLog().add("hll", values);
+        }
+    }
+    // 统计数量
+    Long size = stringRedisTemplate.opsForHyperLogLog().size("hll");
+    System.out.println(size);
+}
+```
+
+经过测试：我们会发生他的误差是在允许范围内，并且内存占用极小
+
 
