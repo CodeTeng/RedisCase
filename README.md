@@ -866,6 +866,433 @@ private Shop queryWithLogicalExpire(Long id) {
 
 详情见 `CacheClient.java` 中查找
 
+## 3. 优惠卷秒杀
+
+### 3.1 全局唯一ID
+
+每个店铺都可以发布优惠券，当用户抢购时，就会生成订单并保存到`tb_voucher_order`这张表中，而订单表如果使用数据库自增ID就存
+
+在一些问题：
+
+* id的规律性太明显
+* 受单表数据量的限制
+
+场景分析一：如果我们的id具有太明显的规则，用户或者说商业对手很容易猜测出来我们的一些敏感信息，比如商城在一天时间内，卖出
+
+了多少单，这明显不合适。
+
+场景分析二：随着我们商城规模越来越大，mysql的单表的容量不宜超过500W，数据量过大之后，我们要进行拆库拆表，但拆分表了之
+
+后，**他们从逻辑上讲他们是同一张表，所以他们的id是不能一样的， 于是乎我们需要保证id的唯一性**。
+
+**全局ID生成器**，是一种在分布式系统下用来生成全局唯一ID的工具，一般要满足下列特性：
+
+![image-20220920202728811](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209202027865.png)
+
+为了增加ID的安全性，我们可以不直接使用Redis自增的数值，而是拼接一些其它信息：
+
+![image-20220920202749249](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209202027289.png)
+
+ID的组成部分
+
+- 符号位：1bit，永远为0
+- 时间戳：31bit，以秒为单位，可以使用69年
+- 序列号：32bit，秒内的计数器，支持每秒产生2^32个不同ID
+
+核心代码：
+
+```java
+@Component
+public class RedisIdWorker {
+    /**
+     * 开始时间戳-2022-1-1-0-0-0
+     */
+    private static final long BEGIN_TIMESTAMP = 1640995200L;
+
+    /**
+     * 序列号的位数
+     */
+    private static final int COUNT_BITS = 32;
+
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+
+    /**
+     * 生成全局唯一ID
+     *
+     * @param keyPrefix 业务前缀
+     * @return 全局唯一ID
+     */
+    public long nextId(String keyPrefix) {
+        // 1. 生成时间戳
+        LocalDateTime now = LocalDateTime.now();
+        long nowSecond = now.toEpochSecond(ZoneOffset.UTC);
+        long timestamp = nowSecond - BEGIN_TIMESTAMP;
+        // 2. 生成序列号
+        // 2.1. 获取当前日期，精确到天
+        String date = now.format(DateTimeFormatter.ofPattern("yyyy:MM:dd"));
+        // 2.2. 自增长
+        long count = stringRedisTemplate.opsForValue().increment("icr:" + keyPrefix + ":" + date);
+        // 3. 拼接并返回
+        return timestamp << COUNT_BITS | count;
+    }
+}
+```
+
+测试代码：
+
+```java
+@SpringBootTest
+public class RedisIdWorkerTest {
+
+    @Resource
+    private RedisIdWorker redisIdWorker;
+
+    private ExecutorService executorService = Executors.newFixedThreadPool(500);
+
+    /**
+     * 测试全局唯一ID
+     */
+    @Test
+    void testIdWorker() throws InterruptedException {
+        CountDownLatch latch = new CountDownLatch(300);
+        Runnable task = () -> {
+            for (int i = 0; i < 100; i++) {
+                long id = redisIdWorker.nextId("order");
+                System.out.println("id=" + id);
+            }
+            latch.countDown();
+        };
+        long begin = System.currentTimeMillis();
+        for (int i = 0; i < 300; i++) {
+            executorService.submit(task);
+        }
+        latch.await();  // 阻塞 --> 让main线程进行阻塞 等待其他线程执行完毕
+        long end = System.currentTimeMillis();
+        System.out.println("time = " + (end - begin));
+    }
+}
+```
+
+> 知识小贴士：
+>
+> 关于`countdownlatch`。`countdownlatch`名为信号枪：主要的作用是**同步协调在多线程的等待于唤醒问题**
+>
+> `CountDownLatch` 中有两个最重要的方法: 1. `countDown`    2. `await`
+>
+> `await`方法是阻塞方法，我们担心分线程没有执行完时，`main`线程就先执行，所以**使用`await`可以让`main`线程阻塞**，那么什么时候`main`线程不再阻塞呢？当`CountDownLatch` 内部维护的变量变为0时，就不再阻塞，直接放行。那么什么时候`CountDownLatch`   维护的变量变为0呢，我们只需要调用一次`countDown` ，内部变量就减少1，我们让分线程和变量绑定， 执行完一个分线程就减少一个变量，当分线程全部走完，`CountDownLatch`维护的变量就是0，此时`await`就不再阻塞，统计出来的时间也就是所有分线程执行完后的时间。
+
+### 3.2 添加优惠卷
+
+我们这里将优惠卷分为两类，分别是平价券和特价券。平价券可以任意购买，而特价券需要秒杀抢购。
+
+![image-20220920203625047](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209202036090.png)
+
+对应的数据库的表分别是：
+
+`tb_voucher`：优惠券的基本信息，优惠金额、使用规则等
+
+`tb_seckill_voucher`：优惠券的库存、开始抢购时间，结束抢购时间。特价优惠券才需要填写这些信息
+
+新增秒杀卷核心代码：
+
+```java
+@Transactional(rollbackFor = Exception.class)
+public void addSeckillVoucher(Voucher voucher) {
+    // 添加优惠卷
+    this.save(voucher);
+    // 添加秒杀信息
+    SeckillVoucher seckillVoucher = new SeckillVoucher();
+    seckillVoucher.setVoucherId(voucher.getId());
+    seckillVoucher.setStock(voucher.getStock());
+    seckillVoucher.setBeginTime(voucher.getBeginTime());
+    seckillVoucher.setEndTime(voucher.getEndTime());
+    seckillVoucherMapper.insert(seckillVoucher);
+    // 保存秒杀库存到redis中
+    stringRedisTemplate.opsForValue().set(RedisConstants.SECKILL_STOCK_KEY + voucher.getId(), voucher.getStock().toString());
+}
+```
+
+添加测试
+
+```json
+POST http://localhost:8081/voucher/seckill
+authorization: 7e847c18f86645ef8aaa0a299a4daee2
+Content-Type: application/json
+
+{
+  "shopId": 1,
+  "title": "100元代金券",
+  "subTitle": "周一至周五均可使用",
+  "rules": "全程通用\\n无需预约\\n可无限叠加\\不兑现、不找零\\n仅限堂食",
+  "payValue": 8000,
+  "actualValue": 10000,
+  "type": 1,
+  "stock": 100,
+  "beginTime": "2022-09-20T10:09:17",
+  "endTime": "2022-09-20T23:09:17"
+}
+```
+
+### 3.3 实现优惠券秒杀下单
+
+![image-20220920205520066](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209202055183.png)
+
+秒杀下单应该思考的内容：
+
+下单时需要判断两点：
+
+* 秒杀是否开始或结束，如果尚未开始或已经结束则无法下单
+* 库存是否充足，不足则无法下单
+
+![image-20220920211335836](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209202113959.png)
+
+核心代码：
+
+```java
+public Result seckillVoucher(Long voucherId) {
+    // 1. 查询优惠卷信息
+    SeckillVoucher voucher = seckillVoucherService.getById(voucherId);
+    // 2. 判断秒杀是否开始
+    if (voucher.getBeginTime().isAfter(LocalDateTime.now())) {
+        // 秒杀未开始
+        return Result.fail("秒杀尚未开始！");
+    }
+    // 3. 判断秒杀是否结束
+    if (voucher.getEndTime().isBefore(LocalDateTime.now())) {
+        // 秒杀已结束
+        return Result.fail("秒杀已结束");
+    }
+    // 4. 判断库存是否充足
+    if (voucher.getStock() < 1) {
+        return Result.fail("库存不足！");
+    }
+    // 5. 扣减库存
+    boolean isSuccess = seckillVoucherService.update().setSql("stock = stock - 1").eq("voucher_id", voucherId).update();
+    if (!isSuccess) {
+        return Result.fail("库存不足！");
+    }
+    // 6. 创建订单
+    VoucherOrder voucherOrder = new VoucherOrder();
+    // 6.1 订单id
+    long orderId = redisIdWorker.nextId("order");
+    voucherOrder.setId(orderId);
+    // 6.2 用户id
+    Long userId = UserHolder.getUser().getId();
+    voucherOrder.setUserId(userId);
+    // 6.3 代金券id
+    voucherOrder.setVoucherId(voucherId);
+    // 6.5 保存订单
+    this.save(voucherOrder);
+    // 7. 返回订单id
+    return Result.ok(orderId);
+}
+```
+
+### 3.4 优惠券秒杀---超卖问题
+
+关于上述代码是有问题的，如下图所示，出现了超卖现象。
+
+![image-20220920213421619](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209202134791.png)
+
+超卖问题是典型的多线程安全问题，针对这一问题的常见解决方案就是**加锁**，而对于加锁，我们通常有两种解决方案：见下图：
+
+![image-20220920215023067](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209202150130.png)
+
+**悲观锁：**
+
+悲观锁可以实现**对于数据的串行化执行**，比如**syn、lock**都是悲观锁的代表，同时，悲观锁中又可以再细分为公平锁，非公平锁，可重入
+
+锁，等等。
+
+**乐观锁：**
+
+乐观锁的关键是**判断之前查询得到的数据是否有被修改过**，常见的方式有两种：
+
+![image-20220920215147987](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209202151086.png)
+
+![image-20220920215154673](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209202151729.png)
+
+乐观锁解决超卖方案一核心代码：
+
+```java
+boolean isSuccess = seckillVoucherService.update()
+                .setSql("stock = stock - 1")
+                .eq("voucher_id", voucherId)
+                .eq("stock", voucher.getStock()).update();
+```
+
+![image-20220920215838781](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209202158836.png)
+
+上述方案也是存在很大问题，当库存数量大于0时，由于还可以进行卖出，但是同一线程进来比较时发现不一致，于是导致不会进行卖出。
+
+改进核心代码：
+
+```java
+boolean isSuccess = seckillVoucherService.update()
+                .setSql("stock = stock - 1")
+                .eq("voucher_id", voucherId)
+                .gt("stock", 0).update();
+```
+
+之前的方式要修改前后都保持一致，但是这样我们分析过，成功的概率太低，所以我们的乐观锁需要变一下，改成stock大于0 即可
+
+**两种方案对比**
+
+![image-20220920221025467](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209202210516.png)
+
+### 3.5 优惠券秒杀---一人一单
+
+需求：修改秒杀业务，要求**同一个优惠券，一个用户只能下一单。**
+
+![image-20220920220908571](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209202209646.png)
+
+核心代码
+
+```java
+// 实现一人一单
+// 5. 根据优惠卷id和用户id查询订单
+Long userId = UserHolder.getUser().getId();
+Long count = this.query().eq("user_id", userId).eq("voucher_id", voucherId).count();
+// 5.1 判断是否存在
+if (count > 0) {
+    // 用户已经购买过
+    return Result.fail("不可再次抢购！");
+}
+```
+
+**存在问题：**现在的问题还是和之前一样，并发过来，查询数据库，都不存在订单，所以我们还是需要加锁，但是乐观锁比较适合更新数
+
+据，而现在是插入数据，所以我们需要使用悲观锁操作。
+
+**注意：**在这里提到了非常多的问题，我们需要慢慢的来思考，首先我们的初始方案是封装了一个createVoucherOrder方法，同时为了确
+
+保他线程安全，在方法上添加了一把synchronized锁
+
+```java
+@Transactional
+public synchronized Result createVoucherOrder(Long voucherId) {
+	Long userId = UserHolder.getUser().getId();
+    // 5.1.查询订单
+    int count = query().eq("user_id", userId).eq("voucher_id", voucherId).count();
+    // 5.2.判断是否存在
+    if (count > 0) {
+        // 用户已经购买过了
+        return Result.fail("用户已经购买过一次！");
+    }
+
+    // 6.扣减库存
+    boolean success = seckillVoucherService.update()
+        .setSql("stock = stock - 1") // set stock = stock - 1
+        .eq("voucher_id", voucherId).gt("stock", 0) // where id = ? and stock > 0
+        .update();
+    if (!success) {
+        // 扣减失败
+        return Result.fail("库存不足！");
+    }
+
+    // 7.创建订单
+    VoucherOrder voucherOrder = new VoucherOrder();
+    // 7.1.订单id
+    long orderId = redisIdWorker.nextId("order");
+    voucherOrder.setId(orderId);
+    // 7.2.用户id
+    voucherOrder.setUserId(userId);
+    // 7.3.代金券id
+    voucherOrder.setVoucherId(voucherId);
+    save(voucherOrder);
+
+    // 7.返回订单id
+    return Result.ok(orderId);
+}
+```
+
+但是这样添加锁，锁的粒度太粗了，在使用锁过程中，控制**锁粒度**是一个非常重要的事情，因为如果锁的粒度太大，会导致每个线程
+
+进来都会锁住，所以我们需要去控制锁的粒度，以下这段代码需要修改为：
+
+```java
+@Transactional
+public  Result createVoucherOrder(Long voucherId) {
+	Long userId = UserHolder.getUser().getId();
+	synchronized(userId.toString().intern()){
+         // 5.1.查询订单
+        int count = query().eq("user_id", userId).eq("voucher_id", voucherId).count();
+        // 5.2.判断是否存在
+        if (count > 0) {
+            // 用户已经购买过了
+            return Result.fail("用户已经购买过一次！");
+        }
+
+        // 6.扣减库存
+        boolean success = seckillVoucherService.update()
+                .setSql("stock = stock - 1") // set stock = stock - 1
+                .eq("voucher_id", voucherId).gt("stock", 0) // where id = ? and stock > 0
+                .update();
+        if (!success) {
+            // 扣减失败
+            return Result.fail("库存不足！");
+        }
+
+        // 7.创建订单
+        VoucherOrder voucherOrder = new VoucherOrder();
+        // 7.1.订单id
+        long orderId = redisIdWorker.nextId("order");
+        voucherOrder.setId(orderId);
+        // 7.2.用户id
+        voucherOrder.setUserId(userId);
+        // 7.3.代金券id
+        voucherOrder.setVoucherId(voucherId);
+        save(voucherOrder);
+
+        // 7.返回订单id
+        return Result.ok(orderId);
+    }
+}
+```
+
+`intern()` 这个方法是从常量池中拿到数据，如果我们直接使用`userId.toString()`他拿到的对象实际上是不同的对象，new出来的
+
+对象，我们使用锁必须保证锁必须是同一把，所以我们需要使用intern()方法。
+
+但是以上代码还是存在问题，问题的原因在于**当前方法被spring的事务控制**，如果你**在方法内部加锁，可能会导致当前方法事务还没有提**
+
+**交，但是锁已经释放也会导致问题**，所以我们选择将当前方法整体包裹起来，确保事务不会出现问题：如下：在seckillVoucher 方法中，
+
+添加以下逻辑，这样就能保证事务的特性，同时也控制了锁的粒度。
+
+![image-20220920223630699](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209202236750.png)
+
+但是以上做法依然有问题，因为你调用的方法，其实是**this.的方式调用的，事务想要生效，还得利用代理来生效**，所以这个地方，我们需
+
+要获得原始的事务对象， 来操作事务。
+
+```java
+synchronized (userId.toString().intern()) {
+    // 获取代理对象(事务) ---> 使事务生效
+    IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
+    // 将锁放在这里为了先执行事务 再释放锁
+    return proxy.createVoucherOrder(voucherId);
+}
+```
+
+### 3.6 集群环境下的并发问题
+
+通过加锁可以解决在单机情况下的一人一单安全问题，但是在集群模式下就不行了。
+
+我们将服务启动两份，端口分别为8081和8082
+
+然后修改nginx的conf目录下的nginx.conf文件，配置反向代理和负载均衡
+
+然后我们用一个用户发送请求，会发现锁失效。
+
+**有关锁失效原因分析**
+
+由于现在我们**部署了多个tomcat**，每个**tomcat都有一个属于自己的jvm**，那么假设在服务器A的tomcat内部，有两个线程，这两个线程由于使用的是同一份代码，那么他们的锁对象是同一个，是可以实现互斥的，但是如果现在是服务器B的tomcat内部，又有两个线程，但是他们的锁对象写的虽然和服务器A一样，但是锁对象却不是同一个，所以线程3和线程4可以实现互斥，但是却无法和线程1和线程2实现互斥，这就是集群环境下，syn锁失效的原因，在这种情况下，我们就需要使用分布式锁来解决这个问题。
+
+![image-20220920225904516](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209202259606.png)
+
+
 ## 8. 达人探店
 
 ### 8.1 点赞功能
