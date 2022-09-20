@@ -1,11 +1,33 @@
+server:
+  port: 8081
+
 spring:
+  application:
+    name: redis-case
+  # MySQL
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://127.0.0.1:3306/rediscase?useSSL=false&serverTimezone=UTC
+    username: root
+    password: 806823
+  # Redis
   redis:
-    host: xxx.xxx.xxx.xxx
+    host: ×××.×××.×××.××
     port: 6379
-    password: xxxxxx
+    password: ××××××
     lettuce:
       pool:
-        max-active: 8  #\u6700\u5927\u8FDE\u63A5
-        max-idle: 8   #\u6700\u5927\u7A7A\u95F2\u8FDE\u63A5
-        min-idle: 0   #\u6700\u5C0F\u7A7A\u95F2\u8FDE\u63A5
-        max-wait: 100ms #\u8FDE\u63A5\u7B49\u5F85\u65F6\u95F4
+        max-active: 8
+        max-idle: 8
+        min-idle: 0
+        max-wait: 100ms
+
+  jackson:
+    default-property-inclusion: NON_NULL
+
+mybatis-plus:
+  type-aliases-package: com.lt.learningredis.entity
+
+logging:
+  level:
+    com.lt.learningredis: debug
