@@ -1,5 +1,10 @@
-package com.lt.learningredis.utils;
+package com.lt.learningredis.utils.locks;
 
+/**
+ * 分布式锁接口
+ *
+ * @author teng
+ */
 public interface ILock {
 
     /**
