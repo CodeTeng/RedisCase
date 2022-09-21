@@ -1,5 +1,8 @@
 package com.lt.learningredis.config;
 
+import org.redisson.Redisson;
+import org.redisson.api.RedissonClient;
+import org.redisson.config.Config;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
@@ -14,6 +17,14 @@ import org.springframework.data.redis.serializer.RedisSerializer;
  */
 @Configuration
 public class RedisConfig {
+
+    @Bean
+    public RedissonClient redisClient() {
+        Config config = new Config();
+        config.useSingleServer().setAddress("redis://124.220.194.38:6379").setPassword("806823");
+        return Redisson.create(config);
+    }
+
     @Bean
     public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory connectionFactory) {
         // 创建RedisTemplate对象
