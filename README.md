@@ -2145,6 +2145,312 @@ Redis提供了三种不同的方式来实现消息队列：
 * 无法避免消息丢失
 * 只支持单消费者
 
+### 7.3 基于PubSub的消息队列
+
+PubSub（发布订阅）是Redis2.0版本引入的消息传递模型。顾名思义，消费者可以订阅一个或多个channel，生产者向对应channel发送
+
+消息后，所有订阅者都能收到相关消息。
+
+`SUBSCRIBE channel [channel]` ：订阅一个或多个频道
+
+`PUBLISH channel msg` ：向一个频道发送消息
+
+`PSUBSCRIBE pattern[pattern]` ：订阅与pattern格式匹配的所有频道
+
+![image-20220922153917549](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209221539665.png)
+
+基于PubSub的消息队列有哪些优缺点？
+
+优点：
+
+* 采用发布订阅模型，支持多生产、多消费
+
+缺点：
+
+* 不支持数据持久化
+* 无法避免消息丢失
+* 消息堆积有上限，超出时数据丢失
+
+### 7.4 基于Stream的消息队列
+
+Stream 是 Redis 5.0 引入的一种新数据类型，可以实现一个功能非常完善的消息队列。
+
+发送消息的命令：
+
+![image-20220922160031352](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209221600421.png)
+
+例如：
+
+![image-20220922160043863](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209221600917.png)
+
+读取消息的方式之一：XREAD
+
+![image-20220922160058253](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209221600332.png)
+
+在业务开发中，我们可以循环的调用XREAD阻塞方式来查询最新消息，从而**实现持续监听队列**的效果，伪代码如下
+
+![image-20220922160129983](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209221601038.png)
+
+注意：当我们指定起始ID为$时，代表读取最新的消息，如果我们处理一条消息的过程中，又有超过1条以上的消息到达队列，则下次获取
+
+时也只能获取到最新的一条，会出现**漏读消息**的问题。
+
+STREAM类型消息队列的XREAD命令特点：
+
+* 消息可回溯
+* 一个消息可以被多个消费者读取
+* 可以阻塞读取
+* 有消息漏读的风险
+
+### 7.5 基于Stream的消息队列-消费者组
+
+消费者组（Consumer Group）：将多个消费者划分到一个组中，监听同一个队列。具备下列特点：
+
+![image-20220922162443373](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209221624433.png)
+
+**创建消费者组**
+
+```redis
+XGROUP CREATE key groupName ID [MKSTREAM]
+```
+
+key：队列名称
+
+groupName：消费者组名称
+
+ID：起始ID标示，$代表队列中最后一个消息，0则代表队列中第一个消息
+
+MKSTREAM：队列不存在时自动创建队列
+
+ **删除指定的消费者组**
+
+```redis
+XGROUP DESTORY key groupName
+```
+
+ 给指定的消费者组添加消费者
+
+```redis
+XGROUP CREATECONSUMER key groupname consumername
+```
+
+ 删除消费者组中的指定消费者
+
+```redis
+XGROUP DELCONSUMER key groupname consumername
+```
+
+**从消费者组读取消息**：
+
+```redis
+XREADGROUP GROUP group consumer [COUNT count] [BLOCK milliseconds] [NOACK] STREAMS key [key ...] ID [ID ...]
+```
+
+* group：消费者组名称
+* consumer：消费者名称，如果消费者不存在，会自动创建一个消费者
+* count：本次查询的最大数量
+* BLOCK milliseconds：当没有消息时最长等待时间
+* NOACK：无需手动ACK，获取到消息后自动确认，一般不设置
+* STREAMS key：指定队列名称
+* ID：获取消息的起始ID
+    - ">"：从下一个未消费的消息开始
+    - 其它：根据指定id从pending-list中获取已消费但未确认的消息，例如0，是从pending-list中的第一个消息开始
+
+消费者监听消息的基本思路：
+
+![image-20220922163036065](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209221630154.png)
+
+STREAM类型消息队列的XREADGROUP命令特点：
+
+- 消息可回溯
+
+- 可以多消费者争抢消息，加快消费速度
+
+- 可以阻塞读取
+
+- 没有消息漏读的风险
+
+- 有消息确认机制，保证消息至少被消费一次
+
+**小总结**
+
+![image-20220922163144391](https://teng-1310538376.cos.ap-chongqing.myqcloud.com/3718/202209221631454.png)
+
+### 7.6 基于Redis的Stream结构作为消息队列，实现异步秒杀下单
+
+需求：
+
+* 创建一个Stream类型的消息队列，名为stream.orders
+* 修改之前的秒杀下单Lua脚本，在认定有抢购资格后，直接向stream.orders中添加消息，内容包含voucherId、userId、orderId
+* 项目启动时，开启一个线程任务，尝试获取stream.orders中的消息，完成下单
+
+修改lua表达式
+
+```lua
+-- 1. 参数列表
+-- 1.1 优惠卷id
+local voucherId = ARGV[1]
+-- 1.2 用户id
+local userId = ARGV[2]
+-- 1.3 订单id
+local orderId = ARGV[3]
+
+-- 2. 数据key
+-- 2.1 库存key
+local stockKey = 'seckill:stock:' .. voucherId
+-- 2.2 订单key
+local orderKey = 'seckill:order:' .. voucherId
+
+-- 3. 脚本业务
+-- 3.1 判断库存是否充足
+if (tonumber(redis.call('GET', stockKey)) <= 0) then
+    -- 3.2 库存不足 返回1
+    return 1
+end
+-- 3.2 判断用户是否下单
+if(redis.call('sismember', orderKey, userId) == 1) then
+    -- 3.3 存在 重复下单 返回2
+    return 2
+end
+-- 3.4 扣库存
+redis.call('incrby', stockKey, -1)
+-- 3.5 下单（保存用户）
+redis.call('sadd', orderKey, userId)
+-- 3.6 发送消息到队列中，XADD stream.orders * k1 v1 k2 v2
+redis.call('xadd', 'stream.orders', '*', 'userId', userId, 'voucherId', voucherId, 'id', orderId)
+-- 成功 返回0
+return 0
+```
+
+核心代码：
+
+```java
+private static final DefaultRedisScript<Long> SECKILL_SCRIPT;
+
+static {
+    SECKILL_SCRIPT = new DefaultRedisScript<>();
+    SECKILL_SCRIPT.setLocation(new ClassPathResource("seckill.lua"));
+    SECKILL_SCRIPT.setResultType(Long.class);
+}
+
+private static final ExecutorService SECKILL_ORDER_EXECUTOR = Executors.newSingleThreadExecutor();
+
+@PostConstruct
+private void init() {
+    SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
+}
+
+private void handleVoucherOrder(VoucherOrder voucherOrder) {
+    // 1. 获取用户
+    Long userId = voucherOrder.getUserId();
+    // 2. 创建锁对象
+    RLock lock = redissonClient.getLock("lock:order:" + userId);
+    // 3. 获取锁
+    boolean isLock = lock.tryLock();
+    // 4. 判断是否获取锁成功
+    if (!isLock) {
+        // 获取锁失败 返回错误或重试
+        log.error("不允许重复下单");
+    }
+    try {
+        proxy.createVoucherOrder(voucherOrder);
+    } finally {
+        // 释放锁
+        lock.unlock();
+    }
+}
+
+private IVoucherOrderService proxy;
+
+private class VoucherOrderHandler implements Runnable {
+    String queueName = "stream.orders";
+
+    @Override
+    public void run() {
+        while (true) {
+            try {
+                // 1. 获取消息队列中的订单信息 xreadgroup group g1 c1 count 1 block 2000 streams stream.orders >
+                List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
+                    Consumer.from("g1", "c1"),
+                    StreamReadOptions.empty().count(1).block(Duration.ofSeconds(2)),
+                    StreamOffset.create(queueName, ReadOffset.lastConsumed())
+                );
+                // 2. 判断消息获取是否成功
+                if (list == null || list.isEmpty()) {
+                    // 2.1 获取失败，说明没有消息，继续下一次循环
+                    continue;
+                }
+                // 3. 解析消息中的订单信息
+                MapRecord<String, Object, Object> record = list.get(0);
+                Map<Object, Object> values = record.getValue();
+                VoucherOrder voucherOrder = BeanUtil.fillBeanWithMap(values, new VoucherOrder(), true);
+                // 4. 获取成功 可以下单 创建订单
+                handleVoucherOrder(voucherOrder);
+                // 5. ACK确认 xack stream.orders g1 id
+                stringRedisTemplate.opsForStream().acknowledge(queueName, "g1", record.getId());
+            } catch (Exception e) {
+                log.error("处理订单异常", e);
+                handlePendingList();
+            }
+        }
+    }
+
+    private void handlePendingList() {
+        while (true) {
+            try {
+                // 1. 获取pending-list中的订单信息 xreadgroup group g1 c1 count 1 block 2000 streams stream.orders 0
+                List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
+                    Consumer.from("g1", "c1"),
+                    StreamReadOptions.empty().count(1),
+                    StreamOffset.create(queueName, ReadOffset.from("0"))
+                );
+                // 2. 判断消息获取是否成功
+                if (list == null || list.isEmpty()) {
+                    // 2.1 获取失败，说明pending-list没有异常消息，结束循环
+                    break;
+                }
+                // 3. 解析消息中的订单信息
+                MapRecord<String, Object, Object> record = list.get(0);
+                Map<Object, Object> values = record.getValue();
+                VoucherOrder voucherOrder = BeanUtil.fillBeanWithMap(values, new VoucherOrder(), true);
+                // 4. 获取成功 可以下单 创建订单
+                handleVoucherOrder(voucherOrder);
+                // 5. ACK确认 xack stream.orders g1 id
+                stringRedisTemplate.opsForStream().acknowledge(queueName, "g1", record.getId());
+            } catch (Exception e) {
+                log.error("处理pending-list订单异常", e);
+            }
+        }
+    }
+}
+
+/**
+ * 利用redis消息队列实现
+ *
+ * @param voucherId 优惠卷id
+ */
+@Override
+public Result seckillVoucher(Long voucherId) {
+    // 1. 执行Lua脚本
+    Long userId = UserHolder.getUser().getId();
+    long orderId = redisIdWorker.nextId("order");
+    Long result = stringRedisTemplate.execute(
+        SECKILL_SCRIPT,
+        Collections.emptyList(),
+        voucherId.toString(), userId.toString(), String.valueOf(orderId)
+    );
+    // 2. 判断结果是否为0
+    int r = result.intValue();
+    if (r != 0) {
+        // 2.1 不为0 代表没有购买资格
+        return Result.fail(r == 1 ? "库存不足" : "不能重复下单");
+    }
+    // 3. 获取代理对象
+    proxy = (IVoucherOrderService) AopContext.currentProxy();
+    // 4. 返回订单id
+    return Result.ok(orderId);
+}
+```
 
 ## 8. 达人探店
 
