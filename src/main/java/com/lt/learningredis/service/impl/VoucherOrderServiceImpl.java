@@ -201,11 +201,11 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 //        }
 //    }
 
-    /**
-     * 利用阻塞队列实现
-     *
-     * @param voucherId 优惠卷id
-     */
+//    /**
+//     * 利用阻塞队列实现
+//     *
+//     * @param voucherId 优惠卷id
+//     */
 //    @Override
 //    public Result seckillVoucher(Long voucherId) {
 //        // 1. 执行Lua脚本
